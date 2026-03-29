@@ -6,20 +6,25 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
-#include <optional>
-#include <cassert>
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
 #include <cstring>
-#include <iomanip>
+#include <expected>
+#include <optional>
+
+/**
+ * @internal
+ * Internal macro to return error automatically when writing data to serial port
+ */
+#define FWLEDMATRIX_GUARDED_WRITE(...) if (const auto error {serial_write(__VA_ARGS__)}) { return *error; }
 
 /**
  * A namespace with various helpful concepts to determine the validity of some types
  */
 namespace fwledconcepts {
     /**
-     *  @tparam Ts the type to check.
+     *  @tparam Ts the types to check.
      *
      *  Concept to verify that all parameters to fwledmatrix::serial_write are valid.
      *  This means that either they are a vector of or are a std::uint8_t.
@@ -27,7 +32,12 @@ namespace fwledconcepts {
     template <typename... Ts>
     concept is_writable_on_serial = requires(Ts... values) {
         {
-            std::conditional_t<((std::is_same_v<decltype(values), std::uint8_t> || std::is_same_v<decltype(values), std::vector<std::uint8_t>>) && ...), std::true_type, std::false_type>{}
+            std::conditional_t<((std::is_same_v<decltype(values), std::uint8_t> ||
+                                 std::is_same_v<decltype(values), std::vector<std::uint8_t>>) && ...),
+                                 std::true_type,
+                                std::false_type>
+            {}
+
         } -> std::same_as<std::true_type>;
     };
 }
@@ -42,25 +52,43 @@ class fwledmatrix {
      * @internal
      * The magic bytes to open command mode for the LED matrix
      */
-    static constexpr std::uint8_t magic_bytes[]{0x32, 0xAC};
+    static constexpr std::uint8_t MAGIC_BYTES[]{0x32, 0xAC};
 
     /**
      * @internal
-     * The magic byte to adjust brightness
+     * The magic byte to adjust brightness.
      */
-    static constexpr std::uint8_t brightness_byte{0x00};
+    static constexpr std::uint8_t BRIGHTNESS_BYTE{0x00};
 
     /**
      * @internal
-     * The magic byte to stage a column
+     * The magic byte to stage a column.
      */
-    static constexpr std::uint8_t stage_byte{0x07};
+    static constexpr std::uint8_t STAGE_BYTE{0x07};
 
     /**
      * @internal
-     * The magic byte to commit a column
+     * The magic byte to commit a column.
      */
-    static constexpr std::uint8_t commit_byte{0x08};
+    static constexpr std::uint8_t COMMIT_BYTE{0x08};
+
+    /**
+     * @internal
+     * The magic byte to send a pattern.
+     */
+    static constexpr std::uint8_t PATTERN_BYTE{0x01};
+
+    /**
+     * @internal
+     * The magic byte to do the percentage pattern
+     */
+    static constexpr std::uint8_t PERCENTAGE_PATTERN_BYTE{0x00};
+
+    /**
+     * @internal
+     * The magic byte to animate the current pattern
+     */
+    static constexpr std::uint8_t ANIMATE_PATTERN_BYTE{0x04};
 
     /**
      * @internal
@@ -118,34 +146,54 @@ class fwledmatrix {
     /**
      * @tparam Params the various types that are being written to the serial port of the LED matrix.
      *
+     * @returns an optional with an error message if a serial port write fails.
+     *
      * @internal
      * Internal function to write a message to the serial port. Assumes the serial port is in working order and open.
      */
     template <typename... Params> requires fwledconcepts::is_writable_on_serial<Params...>
-    void serial_write(const std::uint8_t command, const Params&... params) const {
-        std::vector serial_payload{magic_bytes[0], magic_bytes[1], command};
+    [[nodiscard]] std::optional<std::string> serial_write(const std::uint8_t command, const Params&... params) const {
+        std::vector serial_payload{MAGIC_BYTES[0], MAGIC_BYTES[1], command};
 
         (vector_add(serial_payload, params), ...);
 
-        std::size_t bytes_written{0};
+        long bytes_written{0};
 
-        while (bytes_written < serial_payload.size()) {
-            bytes_written += write(m_serial_conn, &serial_payload[0], serial_payload.size());
+        while (bytes_written < static_cast<long>(serial_payload.size())) {
+            const long this_write_written_bytes{
+                write(m_serial_conn, &serial_payload[0], serial_payload.size())
+            };
+
+            if (this_write_written_bytes == -1) {
+                return "fwledmatrix: failed to write to serial port";
+            }
+
+            bytes_written += this_write_written_bytes;
         }
+
+        return std::nullopt;
     }
 
     /**
      * @internal
      * @tparam T The return type. This can be any unsigned integer.
-     * @returns the data read from the serial port packed into some unsigned integer.
+     *
+     * @returns the data read from the serial port packed into some unsigned integer or an error if the
+     *          data could not be read.
      *
      * Internal function to read data from the serial port and pack it into an unsinged integer.
      * Assumes the serial port is in working order and open.
      */
     template <typename T> requires std::is_integral_v<T> && std::is_unsigned_v<T>
-    T serial_read() const {
-        T result{};
-        return read(m_serial_conn, &result, sizeof(T));
+    [[nodiscard]] std::expected<T, std::string> serial_read() const {
+        std::ptrdiff_t result{};
+        read(m_serial_conn, &result, sizeof(T));
+
+        if (result == -1) {
+            return std::unexpected{"fwledmatrix: failed to read from serial port"};
+        }
+
+        return static_cast<T>(result);
     }
 
 public:
@@ -160,6 +208,22 @@ public:
     static constexpr int height{34};
 
     /**
+     * List of potential patterns in an enum. We skip percentage on purpose as we will provide another function for
+     * it because it requires an extra parameter.
+     */
+    enum class pattern : std::uint8_t {
+        GRADIENT = 0x01,
+        DOUBLE_GRADIENT,
+        DISPLAY_LOTUS_HORIZONTAL,
+        ZIGZAG,
+        FULL_BRIGHTNESS,
+        DISPLAY_PANIC,
+        DISPLAY_LOTUS_VERTICAL
+    };
+
+    /**
+     * @throws std::runtime_error when the serial port cannot be connected to
+     *
      * @param serial_port the path to the serial port to open and write control data to.
      * Most likely `/dev/ttyACM0` or `/dev/ttyACM1`.
      *
@@ -171,14 +235,40 @@ public:
         m_next_state{m_current_state},
         m_current_brightness{0},
         m_next_brightness{0},
-        m_serial_conn{-1} {
-        serial_connect();
+        m_serial_conn{-1}
+
+    {
+        if (const auto error {serial_connect()}) {
+            throw std::runtime_error{*error};
+        }
+
         brightness(255);
-        flush();
+        flush_matrix();
+        animate_pattern(false);
     }
 
     /**
-     * Closes the serial connection on destruction of the object if the serial is connected
+     * @throws std::runtime_error if failed to connect to serial as it is closed in the destructor
+     *
+     * Copy constructor connects to serial also
+     */
+    fwledmatrix(const fwledmatrix& other) :
+        m_serial_port{other.m_serial_port},
+        m_current_state{other.m_current_state},
+        m_next_state{other.m_next_state},
+        m_current_brightness{other.m_current_brightness},
+        m_next_brightness{other.m_next_brightness},
+        m_serial_conn{-1}
+    {
+
+        if (const auto error{serial_connect()}) {
+            throw std::runtime_error{*error};
+        }
+    }
+
+    /**
+     * Closes the serial connection on destruction of the object if the serial is connected.
+     * Hopefully there is no error but the user may want to check.
      */
     ~fwledmatrix() {
         disconnect();
@@ -192,20 +282,20 @@ public:
     }
 
     /**
-     * @throws std::runtime_error when serial port cannot be connected to.
+     * @returns an optional with an error message when serial port cannot be connected to.
      *
      * Function to connect to the serial port of the LED matrix.
      */
-    void serial_connect() {
+    std::optional<std::string> serial_connect() {
         if (connected()) {
-            return;
+            return std::nullopt;
         }
 
         m_serial_conn = open(m_serial_port.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
 
         // Setup serial port
         if (m_serial_conn == -1) {
-            throw std::runtime_error{"fwledmatrix: failed to open serial port"};
+            return "fwledmatrix: failed to open serial port";
         }
 
         struct termios serial_settings;
@@ -224,23 +314,32 @@ public:
 
         serial_settings.c_cflag &= ~(IXON | IXOFF | IXANY); // Disable XON/XOFF for input/output flow control
         serial_settings.c_cflag &= ~(ICANON | ECHO | ECHOE | ISIG); // Non canonical mode
-        serial_settings.c_cflag &= ~OPOST; // No ouput processing
+        serial_settings.c_cflag &= ~OPOST; // No output processing
 
         if (tcsetattr(m_serial_conn, TCSANOW, &serial_settings) != 0) {
-            throw std::runtime_error{"fwledmatrix: failed to set serial port settings"};
+            return "fwledmatrix: failed to set serial port settings";
         }
+
+        return std::nullopt;
     }
 
     /**
+     * @returns an optional value that may have an error message as a string.
+     *
      * Disconnect from the LED matrix's serial port if not disconnected already.
      */
-    void disconnect() {
+    std::optional<std::string> disconnect() {
         if (!connected()) {
-            return;
+            return std::nullopt;
         }
 
-        close(m_serial_conn);
+        if (close(m_serial_conn) == -1) {
+            return "fwledmatrix: serial failed to close";
+        }
+
         m_serial_conn = -1;
+
+        return std::nullopt;
     }
 
     /**
@@ -302,26 +401,83 @@ public:
     }
 
     /**
-     * @throws std::runtime_error if the serial port cannot be opened.
-     * Flushes the changes made onto the LED matrix.
+     * @returns an optional that may have an error message if we are unable to flush to the LED matrix.
+     *
+     * Flushes the changes made onto the LED matrix with the fwledmatrix::get, fwledmatrix::set,
+     * fwledmatrix::operator[], fwledmatrix::clear, and fwledmatrix::brightness functions.
      */
-    void flush() {
+    std::optional<std::string> flush_matrix() {
+        if (!connected()) {
+            return "fwledmatrix: serial port is not connected";
+        }
+
         // Update brightness
         if (m_current_brightness != m_next_brightness) {
-            serial_write(brightness_byte, m_next_brightness);
+            FWLEDMATRIX_GUARDED_WRITE(BRIGHTNESS_BYTE, m_next_brightness);
             m_current_brightness = m_next_brightness;
         }
 
         // Send columns
         for (std::uint8_t col{0}; col < width; ++col) {
             if (m_current_state[col] != m_next_state[col]) {
-                serial_write(stage_byte, col, m_next_state[col]);
+                FWLEDMATRIX_GUARDED_WRITE(STAGE_BYTE, col, m_next_state[col]);
             }
         }
 
         // Render changes on display and update buffer
-        serial_write(commit_byte);
+        FWLEDMATRIX_GUARDED_WRITE(COMMIT_BYTE);
         m_current_state = m_next_state;
+
+        return std::nullopt;
+    }
+
+    /**
+     * @param p the pattern to display.
+     *
+     * @returns an optional with may contain an error message if we are unable to flush the LED matrix.
+     *
+     * Sets and immediately flushes a pattern to the LED matrix.
+     */
+    std::optional<std::string> led_pattern(const pattern p) const {
+        if (!connected()) {
+            return "fwledmatrix: serial port is not connected";
+        }
+
+        FWLEDMATRIX_GUARDED_WRITE(PATTERN_BYTE, static_cast<std::uint8_t>(p));
+
+        return std::nullopt;
+    }
+
+    /**
+     * @param animate animate the current pattern or not.
+     *
+     * @returns an optional which may contain an error message if we are unable to flush the LED matrix.
+     *
+     * Sets whether to animate the current pattern or not.
+     */
+    std::optional<std::string> animate_pattern(const bool animate) const {
+        if (!connected()) {
+            return "fwledmatrix: serial port is not connected";
+        }
+
+        FWLEDMATRIX_GUARDED_WRITE(ANIMATE_PATTERN_BYTE, static_cast<std::uint8_t>(animate));
+
+        return std::nullopt;
+    }
+
+    /**
+     * @returns an optional which may contain an error message if we are unable to flush the LED matrix.
+     *
+     * Sets the percentage fill of the LED matrix and immediately flushes
+     */
+    std::optional<std::string> percentage(const std::uint8_t percentage) const {
+        if (percentage > 100) {
+            return "fwledmatrix: the requested percentage is greater than 100";
+        }
+
+        FWLEDMATRIX_GUARDED_WRITE(PATTERN_BYTE, PERCENTAGE_PATTERN_BYTE, percentage);
+
+        return std::nullopt;
     }
 };
 

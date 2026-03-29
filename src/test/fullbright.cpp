@@ -13,8 +13,8 @@ int main() {
         }
     }
 
-    matrix.flush();
-    matrix1.flush();
+    matrix.flush_matrix();
+    matrix1.flush_matrix();
 
     std::this_thread::sleep_for(std::chrono::seconds(5));
 
@@ -28,8 +28,8 @@ int main() {
         }
     }
 
-    matrix.flush();
-    matrix1.flush();
+    matrix.flush_matrix();
+    matrix1.flush_matrix();
 
     return 0;
 }
